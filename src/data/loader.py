@@ -65,12 +65,25 @@ def load_tsb_adm(
         )
 
     index_df = pd.read_csv(index_path)
+
+    # Official TSB-AD repo uses 'file_name'; some mirrors use 'filepath'.
+    if "filepath" in index_df.columns:
+        path_col = "filepath"
+    elif "file_name" in index_df.columns:
+        path_col = "file_name"
+    else:
+        raise ValueError(
+            f"{index_path} must contain a 'file_name' or 'filepath' column. "
+            f"Found: {list(index_df.columns)}"
+        )
+
     records = []
 
     for _, row in index_df.iterrows():
-        series_path = os.path.join(tsb_dir, row["filepath"])
-        if not os.path.exists(series_path):
-            print(f"  [WARN] Series file not found, skipping: {series_path}")
+        rel_path    = str(row[path_col]).strip()
+        series_path = _resolve_tsb_series_path(tsb_dir, rel_path)
+        if series_path is None:
+            print(f"  [WARN] Series file not found, skipping: {rel_path}")
             continue
 
         df = pd.read_csv(series_path)
@@ -142,7 +155,7 @@ def load_tsb_adm(
             train_data, test_data = zscore_normalize(train_data, test_data)
 
         records.append(SeriesRecord(
-            name=row.get("name", os.path.splitext(os.path.basename(series_path))[0]),
+            name=row.get("name", os.path.splitext(os.path.basename(rel_path))[0]),
             train=train_data,
             test=test_data,
             labels=test_labels,
@@ -151,6 +164,35 @@ def load_tsb_adm(
         ))
 
     return records
+
+
+def _resolve_tsb_series_path(tsb_dir: str, rel_path: str) -> Optional[str]:
+    """
+    Locate a TSB-AD-M series CSV under tsb_dir.
+
+    The zip from thedatum.org contains only series CSVs (often under TSB-AD-M/).
+    Eval/Tuning index files come separately from the TSB-AD GitHub repo and list
+    entries by file_name only, e.g. '004_MSL_id_3_Sensor_tr_530_1st_630.csv'.
+    """
+    rel_path = rel_path.strip().replace("\\", "/")
+    basename = os.path.basename(rel_path)
+
+    candidates = [
+        os.path.join(tsb_dir, rel_path),
+        os.path.join(tsb_dir, "TSB-AD-M", rel_path),
+        os.path.join(tsb_dir, "TSB-AD-M", basename),
+        os.path.join(tsb_dir, basename),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+
+    # Last resort: walk tsb_dir and match by basename (handles nested unzip layouts).
+    for root, _, files in os.walk(tsb_dir):
+        if basename in files:
+            return os.path.join(root, basename)
+
+    return None
 
 
 # ─────────────────────────────────────────────
