@@ -308,11 +308,7 @@ def load_legacy(
     for t_f, te_f, l_f in zip(train_files, test_files, label_files):
         train_data  = _read_data_file(t_f).astype(np.float32)
         test_data   = _read_data_file(te_f).astype(np.float32)
-        test_labels = _read_data_file(l_f).squeeze().astype(np.int32)
-
-        # Ensure 1D labels — squeeze can produce 0-D on single-value files
-        if test_labels.ndim == 0:
-            test_labels = test_labels.reshape(1)
+        test_labels = _read_label_file(l_f)
 
         if len(test_data) != len(test_labels):
             raise ValueError(
@@ -439,17 +435,14 @@ def _load_flat_style(
     Load PSM-style datasets where train.csv, test.csv, test_label.csv
     all sit in the same directory with no subfolders.
 
-    PSM structure:
-        data/train.csv        — (132481, 25) no header
-        data/test.csv         — (87841,  25) no header
-        data/test_label.csv   — (87841,   1) binary labels, no header
+    PSM structure (Kaggle upload may include headers and a timestamp column):
+        data/train.csv        — header row + 25 sensor columns (+ optional timestamp)
+        data/test.csv         — same
+        data/test_label.csv   — header row + binary label column
     """
     train_data  = _read_data_file(train_path).astype(np.float32)
     test_data   = _read_data_file(test_path).astype(np.float32)
-    test_labels = _read_data_file(label_path).squeeze().astype(np.int32)
-
-    if test_labels.ndim == 0:
-        test_labels = test_labels.reshape(1)
+    test_labels = _read_label_file(label_path)
 
     if len(test_data) != len(test_labels):
         raise ValueError(
@@ -470,22 +463,80 @@ def _load_flat_style(
     )]
 
 
-def _read_data_file(path: str) -> np.ndarray:
+def _read_data_file(path: str, numeric_only: bool = True) -> np.ndarray:
     """
     Read a .csv or .txt data file into a numpy array.
-    Handles both comma-separated and space-separated formats.
-    Assumes no header row (standard for all SMD/PSM/SWaT files).
+
+    Handles:
+        - Comma- or whitespace-separated files (SMD .txt uses whitespace)
+        - Optional header row (PSM Kaggle uploads include 'timestamp_(min)' etc.)
+        - Non-numeric columns dropped automatically (timestamps, metadata)
     """
-    try:
-        # Try comma separator first (PSM, SWaT, repackaged SMD)
-        arr = pd.read_csv(path, header=None, sep=",").values
-        if arr.shape[1] == 1:
-            # Single column after comma split — likely space-separated
-            raise ValueError("single column — retry with space separator")
-        return arr
-    except Exception:
-        # Fall back to whitespace separator (original SMD .txt files)
-        return pd.read_csv(path, header=None, sep=r"\s+").values
+    path = str(path)
+
+    # ── Comma-separated (.csv and some .txt) ──────────────────────────────
+    if path.lower().endswith(".csv"):
+        df = pd.read_csv(path, low_memory=False)
+        arr = _numeric_frame_to_array(df, path, sep=",")
+        if arr is not None:
+            return arr
+        raise ValueError(f"No numeric data found in {path}")
+
+    # ── Whitespace-separated (original SMD .txt) ────────────────────────
+    df = pd.read_csv(path, header=None, sep=r"\s+", low_memory=False)
+    if numeric_only:
+        num = df.apply(pd.to_numeric, errors="coerce")
+        num = num.dropna(axis=1, how="all").dropna(axis=0, how="all")
+        if num.shape[1] == 0:
+            raise ValueError(f"No numeric data found in {path}")
+        return num.values
+    return df.values
+
+
+def _numeric_frame_to_array(df: pd.DataFrame, path: str, sep: str) -> Optional[np.ndarray]:
+    """
+    Extract numeric sensor columns from a DataFrame.
+    Retries with header=None if the first row was mis-parsed as header.
+    """
+    num = df.select_dtypes(include=[np.number])
+    if num.shape[1] > 0:
+        return num.values
+
+    # First row may have been misread as column names (headerless file).
+    df2 = pd.read_csv(path, header=None, sep=sep, low_memory=False)
+    num2 = df2.apply(pd.to_numeric, errors="coerce")
+    num2 = num2.dropna(axis=1, how="all").dropna(axis=0, how="all")
+    if num2.shape[1] > 0:
+        return num2.values
+
+    return None
+
+
+def _read_label_file(path: str) -> np.ndarray:
+    """
+    Read a binary label file (0/1) from legacy datasets.
+    Handles optional header row and named label columns.
+    """
+    df = pd.read_csv(path, low_memory=False)
+
+    # Headerless single-column file: first value became column name '0' or '1'.
+    if df.shape[1] == 1 and str(df.columns[0]) in ("0", "1", "0.0", "1.0"):
+        df = pd.read_csv(path, header=None, low_memory=False)
+
+    for col in df.columns:
+        if str(col).lower() in ("label", "labels", "anomaly", "is_anomaly"):
+            vals = pd.to_numeric(df[col], errors="coerce").fillna(0)
+            return vals.astype(np.int32).values.ravel()
+
+    num = df.select_dtypes(include=[np.number])
+    if num.shape[1] >= 1:
+        vals = pd.to_numeric(num.iloc[:, 0], errors="coerce").fillna(0)
+        return vals.astype(np.int32).values.ravel()
+
+    # Last resort: treat as headerless single column
+    df = pd.read_csv(path, header=None, low_memory=False)
+    vals = pd.to_numeric(df.iloc[:, 0], errors="coerce").fillna(0)
+    return vals.astype(np.int32).values.ravel()
 
 
 def _collect_data_files(directory: str) -> List[str]:
