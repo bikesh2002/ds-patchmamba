@@ -486,7 +486,67 @@ def load_legacy(
     return records
 
 
-def _load_swat_style(
+# Official SWaT 2015 attack-period length (iTrust / Anomaly Transformer benchmark).
+SWAT_ATTACK_PERIOD_ROWS = 449_919
+
+
+def _swat_use_attack_csv_directly(df: pd.DataFrame, label_col: str, ratio: float) -> bool:
+    """
+    Return True when attack.csv is the full 4-day test file (mixed Normal/Attack).
+    Some Kaggle uploads ship a separate attack.csv containing ONLY attack
+    timesteps (all labels 'Attack', ~54k rows) — that file is NOT a valid test set.
+    """
+    if len(df) < 350_000:
+        return False
+    if not (0.05 <= ratio <= 0.25):
+        return False
+    return _column_has_swat_string_labels(df[label_col]) or _is_swat_label_column_name(label_col)
+
+
+def _load_swat_test_period(
+    base: str,
+    attack_path: str,
+) -> Tuple[pd.DataFrame, str, np.ndarray, float, str]:
+    """
+    Load SWaT test data + labels.
+
+    Standard: attack.csv (~450k rows, ~12% anomalies).
+    Kaggle vishala28 quirk: attack.csv is attack-only (~54k rows, 100% Attack);
+    full test period = last SWAT_ATTACK_PERIOD_ROWS rows of merged.csv.
+    """
+    attack_df, label_col, test_labels, ratio = _read_swat_test_with_labels(attack_path)
+    attack_rows = len(attack_df)
+
+    if _swat_use_attack_csv_directly(attack_df, label_col, ratio):
+        return attack_df, label_col, test_labels, ratio, "attack.csv"
+
+    merged_path = os.path.join(base, "merged.csv")
+    if not os.path.exists(merged_path):
+        raise ValueError(
+            f"{attack_path} is not a valid SWaT test file "
+            f"(ratio {ratio:.1%}, {attack_rows:,} rows). "
+            f"Expected ~{SWAT_ATTACK_PERIOD_ROWS:,} rows with mixed Normal/Attack labels, "
+            f"or a merged.csv to extract the attack period from."
+        )
+
+    mdf, mcol, _, _ = _read_swat_test_with_labels(merged_path)
+    test_len = min(SWAT_ATTACK_PERIOD_ROWS, len(mdf))
+    mdf = mdf.iloc[-test_len:].reset_index(drop=True)
+    test_labels = _parse_binary_labels(mdf[mcol].values)
+    ratio = float(test_labels.mean())
+
+    if not (0.05 <= ratio <= 0.25):
+        raise ValueError(
+            f"SWaT test slice from merged.csv has unexpected anomaly ratio {ratio:.1%} "
+            f"({len(test_labels):,} rows). Expected ~12%."
+        )
+
+    print(
+        f"  [INFO] SWaT: attack.csv contains only attack timesteps "
+        f"({attack_rows:,} rows, all labeled Attack) — "
+        f"using last {test_len:,} rows of merged.csv as the 4-day test period."
+    )
+    return mdf, mcol, test_labels, ratio, f"merged.csv (last {test_len:,} rows)"
     base: str,
     dataset: str,
     normal_path: str,
@@ -496,10 +556,11 @@ def _load_swat_style(
     """
     Load SWaT-style datasets where:
         normal.csv  = training data (all normal, sensor columns only)
-        attack.csv  = test data (sensor columns + 1 label column at the end)
+        attack.csv  = test data OR attack-only snippets (Kaggle vishala28 upload)
+        merged.csv  = full timeline; last 449,919 rows used when attack.csv is attack-only
 
     The label column may contain:
-        - String values: "Normal" → 0, "Attack" / "attack" → 1
+        - String values: "Normal" → 0, "Attack" / attack types → 1
         - Integer values: 0 / 1 directly
     """
     # ── Load training data ─────────────────────────────────────────────────
@@ -513,23 +574,9 @@ def _load_swat_style(
     train_data = _sanitize_sensor_data(train_df.values)
 
     # ── Load test data + labels ────────────────────────────────────────────
-    # Standard SWaT benchmark: test = attack.csv (4-day period with Normal/Attack labels).
-    # Only fall back to merged.csv if attack.csv has no identifiable label column.
-    attack_df, label_col, test_labels, ratio = _read_swat_test_with_labels(attack_path)
-
-    if not (0.001 <= ratio <= 0.45):
-        merged_path = os.path.join(base, "merged.csv")
-        if os.path.exists(merged_path):
-            try:
-                mdf, mcol, mlabels, mratio = _read_swat_test_with_labels(merged_path)
-                if 0.001 <= mratio <= 0.45:
-                    print(
-                        f"  [INFO] {dataset}: attack.csv ratio {ratio:.1%} out of range — "
-                        f"using merged.csv (ratio {mratio:.1%}, label col={mcol!r})."
-                    )
-                    attack_df, label_col, test_labels, ratio = mdf, mcol, mlabels, mratio
-            except ValueError:
-                pass
+    attack_df, label_col, test_labels, ratio, test_source = _load_swat_test_period(
+        base, attack_path
+    )
 
     if _is_swat_sensor_column_name(label_col):
         raise ValueError(
@@ -537,7 +584,7 @@ def _load_swat_style(
         )
 
     print(
-        f"  [INFO] {dataset}: test labels from {label_col!r} "
+        f"  [INFO] {dataset}: test from {test_source}, labels in {label_col!r} "
         f"(anomaly ratio {ratio:.1%}, test rows {len(test_labels):,})."
     )
 
