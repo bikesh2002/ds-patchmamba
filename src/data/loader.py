@@ -87,8 +87,11 @@ def _parse_binary_labels(raw_labels) -> np.ndarray:
 
 
 def _is_swat_label_column_name(col: str) -> bool:
-    key = str(col).strip().lower().replace(" ", "").replace("-", "_")
-    if key in ("normal/attack", "normal_attack", "label", "labels", "anomaly", "attack_label"):
+    key = str(col).strip().lstrip("\ufeff").lower().replace(" ", "").replace("-", "_")
+    if key in (
+        "normal/attack", "normal_attack", "label", "labels",
+        "anomaly", "anomaly_label", "attack_label", "ground_truth",
+    ):
         return True
     return "normal" in key and "attack" in key
 
@@ -112,30 +115,17 @@ def _column_has_swat_string_labels(series: pd.Series) -> bool:
     return bool((s == "normal").mean() > 0.05)
 
 
-def _is_trusted_swat_label_column(df: pd.DataFrame, col: str) -> bool:
-    """Reject sensor columns that accidentally pass the anomaly-ratio heuristic."""
-    if _is_swat_sensor_column_name(col):
-        return False
-    if _is_swat_label_column_name(col):
-        return True
-    if _column_has_swat_string_labels(df[col]):
-        return True
-    last = df.columns[-1]
-    if col == last:
-        numeric = pd.to_numeric(df[col], errors="coerce")
-        if numeric.notna().mean() > 0.95:
-            u = set(numeric.dropna().unique())
-            if u.issubset({0, 1, 0.0, 1.0}):
-                return True
-    return False
+
+def _read_swat_csv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, header=0, low_memory=False)
+    df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
+    return df.loc[:, ~df.columns.str.startswith("Unnamed")]
 
 
-def _detect_swat_label_column(df: pd.DataFrame) -> str:
+def _find_swat_label_column(df: pd.DataFrame) -> Optional[str]:
     """
-    Find the label column in SWaT attack.csv / merged.csv.
-
-    SWaT labels are almost always a dedicated column (Normal/Attack strings or 0/1),
-    never a sensor tag like P302 or LIT101.
+    Locate the SWaT label column by name or by 'Normal' string content.
+    Returns None if no trustworthy label column is found.
     """
     for col in df.columns:
         if _is_swat_label_column_name(col):
@@ -147,44 +137,34 @@ def _detect_swat_label_column(df: pd.DataFrame) -> str:
 
     last = df.columns[-1]
     if not _is_swat_sensor_column_name(last):
-        labels = _parse_binary_labels(df[last].values)
-        ratio  = float(labels.mean())
-        if 0.001 <= ratio <= 0.45:
-            return last
+        numeric = pd.to_numeric(df[last], errors="coerce")
+        if numeric.notna().mean() > 0.95:
+            u = set(numeric.dropna().unique())
+            if u.issubset({0, 1, 0.0, 1.0}):
+                return last
 
-    best_col   = None
-    best_score = float("inf")
-    for col in df.columns:
-        if _is_swat_sensor_column_name(col):
-            continue
-        try:
-            labels = _parse_binary_labels(df[col].values)
-            ratio  = float(labels.mean())
-            if 0.001 <= ratio <= 0.45:
-                score = abs(ratio - 0.127)
-                if score < best_score:
-                    best_score = score
-                    best_col   = col
-        except Exception:
-            continue
-
-    if best_col is not None:
-        return best_col
-
-    for col in df.columns:
-        if _is_swat_label_column_name(col):
-            return col
-    return df.columns[-1]
+    return None
 
 
 def _read_swat_test_with_labels(
     path: str,
 ) -> Tuple[pd.DataFrame, str, np.ndarray, float]:
     """Load a SWaT test CSV and return (df, label_col, binary labels, anomaly ratio)."""
-    df = pd.read_csv(path, header=0, low_memory=False)
-    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+    df = _read_swat_csv(path)
 
-    label_col   = _detect_swat_label_column(df)
+    label_col = _find_swat_label_column(df)
+    if label_col is None:
+        raise ValueError(
+            f"No SWaT label column found in {path}. "
+            f"Expected 'Normal/Attack' or a column containing 'Normal' strings. "
+            f"Last columns: {list(df.columns[-5:])}"
+        )
+    if _is_swat_sensor_column_name(label_col):
+        raise ValueError(
+            f"SWaT label column resolved to sensor tag {label_col!r} in {path} — "
+            f"refusing to use sensor data as labels."
+        )
+
     test_labels = _parse_binary_labels(df[label_col].values)
     ratio       = float(test_labels.mean())
 
@@ -533,44 +513,33 @@ def _load_swat_style(
     train_data = _sanitize_sensor_data(train_df.values)
 
     # ── Load test data + labels ────────────────────────────────────────────
-    merged_path = os.path.join(base, "merged.csv")
-    test_candidates = [attack_path]
-    if os.path.exists(merged_path):
-        test_candidates.append(merged_path)
+    # Standard SWaT benchmark: test = attack.csv (4-day period with Normal/Attack labels).
+    # Only fall back to merged.csv if attack.csv has no identifiable label column.
+    attack_df, label_col, test_labels, ratio = _read_swat_test_with_labels(attack_path)
 
-    best: Optional[Tuple[str, pd.DataFrame, str, np.ndarray, float]] = None
-    best_score = float("inf")
-    for path in test_candidates:
-        try:
-            df, label_col, labels, ratio = _read_swat_test_with_labels(path)
-            if not _is_trusted_swat_label_column(df, label_col):
-                continue
-            if 0.001 <= ratio <= 0.45:
-                score = abs(ratio - 0.127)
-                if path == attack_path:
-                    score -= 0.01  # prefer attack.csv (standard 4-day test split)
-                if score < best_score:
-                    best_score = score
-                    best = (path, df, label_col, labels, ratio)
-        except Exception:
-            continue
+    if not (0.001 <= ratio <= 0.45):
+        merged_path = os.path.join(base, "merged.csv")
+        if os.path.exists(merged_path):
+            try:
+                mdf, mcol, mlabels, mratio = _read_swat_test_with_labels(merged_path)
+                if 0.001 <= mratio <= 0.45:
+                    print(
+                        f"  [INFO] {dataset}: attack.csv ratio {ratio:.1%} out of range — "
+                        f"using merged.csv (ratio {mratio:.1%}, label col={mcol!r})."
+                    )
+                    attack_df, label_col, test_labels, ratio = mdf, mcol, mlabels, mratio
+            except ValueError:
+                pass
 
-    if best is not None:
-        test_path, attack_df, label_col, test_labels, ratio = best
-        if test_path != attack_path:
-            print(
-                f"  [INFO] {dataset}: using {os.path.basename(test_path)} for test "
-                f"(anomaly ratio {ratio:.1%}, label col={label_col!r})."
-            )
-    else:
-        attack_df, label_col, test_labels, ratio = _read_swat_test_with_labels(
-            attack_path
+    if _is_swat_sensor_column_name(label_col):
+        raise ValueError(
+            f"{dataset}: label column {label_col!r} is a sensor tag, not a label column."
         )
-        if ratio > 0.45:
-            print(
-                f"  [WARN] {dataset}: anomaly ratio {ratio:.1%} from attack.csv "
-                f"(label col={label_col!r}) — verify SWaT label format."
-            )
+
+    print(
+        f"  [INFO] {dataset}: test labels from {label_col!r} "
+        f"(anomaly ratio {ratio:.1%}, test rows {len(test_labels):,})."
+    )
 
     # Drop label column; keep only numeric sensor columns
     sensor_cols = [c for c in attack_df.columns if c != label_col]
