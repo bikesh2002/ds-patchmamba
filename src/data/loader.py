@@ -23,6 +23,40 @@ from dataclasses import dataclass
 from .preprocessing import zscore_normalize, train_val_split_normal
 
 
+def _sanitize_sensor_data(arr: np.ndarray) -> np.ndarray:
+    """
+    Replace Inf with NaN, then forward/backward fill remaining NaNs.
+    SWaT and some PSM uploads contain missing sensor readings.
+    """
+    arr = np.asarray(arr, dtype=np.float64)
+    arr[~np.isfinite(arr)] = np.nan
+    if arr.size == 0:
+        return arr.astype(np.float32)
+    df = pd.DataFrame(arr)
+    df = df.ffill().bfill().fillna(0.0)
+    return df.values.astype(np.float32)
+
+
+def _parse_binary_labels(raw_labels) -> np.ndarray:
+    """
+    Parse binary anomaly labels from numeric or string columns.
+    Handles: 0/1, 0.0/1.0, 'Normal'/'Attack', '0'/'1' strings.
+    """
+    raw = np.asarray(raw_labels).ravel()
+
+    numeric = pd.to_numeric(raw, errors="coerce")
+    if np.isfinite(numeric).mean() > 0.95:
+        return (numeric.fillna(0).values != 0).astype(np.int32)
+
+    s = pd.Series(raw).astype(str).str.strip().str.lower()
+    labels = np.where(
+        s.isin(["normal", "0", "0.0", "false", "no"]),
+        0,
+        1,
+    ).astype(np.int32)
+    return labels
+
+
 @dataclass
 class SeriesRecord:
     name: str
@@ -356,7 +390,7 @@ def _load_swat_style(
 
     # Drop any non-numeric columns (e.g. timestamp columns)
     train_df = train_df.select_dtypes(include=[np.number])
-    train_data = train_df.values.astype(np.float32)
+    train_data = _sanitize_sensor_data(train_df.values)
 
     # ── Load test data + labels ────────────────────────────────────────────
     attack_df = pd.read_csv(attack_path, header=0, low_memory=False)
@@ -380,20 +414,14 @@ def _load_swat_style(
             f"Columns found: {list(attack_df.columns)}"
         )
 
-    # Convert labels to binary int32
     raw_labels = attack_df[label_col].values
-    if raw_labels.dtype == object or raw_labels.dtype.kind in ("U", "S"):
-        # String labels — "Normal" → 0, anything else → 1
-        test_labels = np.where(
-            np.char.lower(raw_labels.astype(str)) == "normal", 0, 1
-        ).astype(np.int32)
-    else:
-        test_labels = (raw_labels != 0).astype(np.int32)
+    # Convert labels to binary int32 (handles numeric and string labels)
+    test_labels = _parse_binary_labels(raw_labels)
 
     # Drop label column; keep only numeric sensor columns
     sensor_cols = [c for c in attack_df.columns if c != label_col]
     attack_df   = attack_df[sensor_cols].select_dtypes(include=[np.number])
-    test_data   = attack_df.values.astype(np.float32)
+    test_data   = _sanitize_sensor_data(attack_df.values)
 
     # Guard: column count must match between train and test
     if train_data.shape[1] != test_data.shape[1]:
@@ -497,7 +525,7 @@ def _read_txt_numeric(path: str) -> np.ndarray:
             if arr.ndim == 1:
                 arr = arr.reshape(-1, 1)
             if arr.size > 0 and arr.shape[1] > 0:
-                return arr
+                return _sanitize_sensor_data(arr)
         except (ValueError, OSError):
             continue
 
@@ -508,7 +536,7 @@ def _read_txt_numeric(path: str) -> np.ndarray:
             num = df.apply(pd.to_numeric, errors="coerce")
             num = num.dropna(axis=1, how="all").dropna(axis=0, how="any")
             if num.shape[1] > 0 and num.shape[0] > 0:
-                return num.values
+                return _sanitize_sensor_data(num.values)
         except Exception:
             continue
 
@@ -532,7 +560,7 @@ def _read_csv_numeric(path: str) -> np.ndarray:
     coerced = coerced.dropna(axis=1, how="all").dropna(axis=0, how="all")
 
     if coerced.shape[1] > 0:
-        return coerced.values
+        return _sanitize_sensor_data(coerced.values)
 
     # Headerless file: first row may literally be column names like 'timestamp_(min)'
     df2 = pd.read_csv(path, header=None, low_memory=False)
@@ -544,7 +572,7 @@ def _read_csv_numeric(path: str) -> np.ndarray:
     coerced2 = coerced2.dropna(axis=1, how="all").dropna(axis=0, how="all")
     if coerced2.shape[1] == 0:
         raise ValueError(f"No numeric data found in {path}")
-    return coerced2.values
+    return _sanitize_sensor_data(coerced2.values)
 
 
 def _looks_numeric(val) -> bool:
