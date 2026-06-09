@@ -1,7 +1,7 @@
 # Data — never commit raw datasets or downloaded files
-data/
+# /data/ anchors the rule to the project root only, not src/data/
+/data/
 *.zip
-*.csv
 
 # Model outputs — large binary files
 checkpoints/
