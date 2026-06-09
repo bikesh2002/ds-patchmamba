@@ -470,46 +470,61 @@ def _read_data_file(path: str, numeric_only: bool = True) -> np.ndarray:
     Handles:
         - Comma- or whitespace-separated files (SMD .txt uses whitespace)
         - Optional header row (PSM Kaggle uploads include 'timestamp_(min)' etc.)
-        - Non-numeric columns dropped automatically (timestamps, metadata)
+        - Non-numeric / timestamp columns dropped automatically
+        - Columns stored as object dtype coerced via pd.to_numeric
     """
     path = str(path)
 
-    # ── Comma-separated (.csv and some .txt) ──────────────────────────────
     if path.lower().endswith(".csv"):
-        df = pd.read_csv(path, low_memory=False)
-        arr = _numeric_frame_to_array(df, path, sep=",")
-        if arr is not None:
-            return arr
-        raise ValueError(f"No numeric data found in {path}")
+        return _read_csv_numeric(path)
 
-    # ── Whitespace-separated (original SMD .txt) ────────────────────────
+    # Whitespace-separated (original SMD .txt)
     df = pd.read_csv(path, header=None, sep=r"\s+", low_memory=False)
-    if numeric_only:
-        num = df.apply(pd.to_numeric, errors="coerce")
-        num = num.dropna(axis=1, how="all").dropna(axis=0, how="all")
-        if num.shape[1] == 0:
-            raise ValueError(f"No numeric data found in {path}")
-        return num.values
-    return df.values
+    num = df.apply(pd.to_numeric, errors="coerce")
+    num = num.dropna(axis=1, how="all").dropna(axis=0, how="all")
+    if num.shape[1] == 0:
+        raise ValueError(f"No numeric data found in {path}")
+    return num.values
 
 
-def _numeric_frame_to_array(df: pd.DataFrame, path: str, sep: str) -> Optional[np.ndarray]:
-    """
-    Extract numeric sensor columns from a DataFrame.
-    Retries with header=None if the first row was mis-parsed as header.
-    """
-    num = df.select_dtypes(include=[np.number])
-    if num.shape[1] > 0:
-        return num.values
+def _read_csv_numeric(path: str) -> np.ndarray:
+    """Read a CSV sensor file, dropping timestamps and coercing all sensor cols to float."""
+    df = pd.read_csv(path, low_memory=False)
 
-    # First row may have been misread as column names (headerless file).
-    df2 = pd.read_csv(path, header=None, sep=sep, low_memory=False)
-    num2 = df2.apply(pd.to_numeric, errors="coerce")
-    num2 = num2.dropna(axis=1, how="all").dropna(axis=0, how="all")
-    if num2.shape[1] > 0:
-        return num2.values
+    # Drop known non-sensor columns by name (PSM Kaggle upload)
+    drop = [
+        c for c in df.columns
+        if str(c).lower() in ("timestamp_(min)", "timestamp", "time", "date", "index")
+    ]
+    if drop:
+        df = df.drop(columns=drop)
 
-    return None
+    # Coerce every remaining column to numeric (handles object-dtype sensor cols)
+    coerced = df.apply(pd.to_numeric, errors="coerce")
+    coerced = coerced.dropna(axis=1, how="all").dropna(axis=0, how="all")
+
+    if coerced.shape[1] > 0:
+        return coerced.values
+
+    # Headerless file: first row may literally be column names like 'timestamp_(min)'
+    df2 = pd.read_csv(path, header=None, low_memory=False)
+    first = df2.iloc[0, 0]
+    if isinstance(first, str) and not _looks_numeric(first):
+        df2 = df2.iloc[1:].reset_index(drop=True)
+
+    coerced2 = df2.apply(pd.to_numeric, errors="coerce")
+    coerced2 = coerced2.dropna(axis=1, how="all").dropna(axis=0, how="all")
+    if coerced2.shape[1] == 0:
+        raise ValueError(f"No numeric data found in {path}")
+    return coerced2.values
+
+
+def _looks_numeric(val) -> bool:
+    try:
+        float(val)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def _read_label_file(path: str) -> np.ndarray:
