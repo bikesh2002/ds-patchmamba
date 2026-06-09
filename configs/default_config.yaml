@@ -1,0 +1,152 @@
+# DS-PatchMamba — Default Configuration
+# All hyperparameters in one place. Values here are the final locked values.
+# HP selection was performed on TSB-AD-M Tuning set ONLY.
+# Eval set (TSB-AD-M-Eva.csv) is NEVER touched during tuning.
+
+# ─────────────────────────────────────────────
+# Data
+# ─────────────────────────────────────────────
+data:
+  window_length: 300          # L — primary window. 100/1000 used only in ablations.
+  stride_train: 150           # 50% overlap during training
+  stride_infer: 150           # 50% overlap during inference
+  stride_short: 50            # For series with avg_length < 5000 (e.g. MSL)
+  train_val_split: 0.8        # 80% normal train / 20% normal val (for early stopping)
+  channel_mask_frac: 0.15     # Fraction of channels to randomly mask per batch
+  # channel_mask_k = max(1, floor(V * channel_mask_frac)) — hard floor ensures k>=1
+
+# ─────────────────────────────────────────────
+# Architecture
+# ─────────────────────────────────────────────
+model:
+  # Patching
+  patch_size_fine: 12         # P_f — targets point/contextual anomalies
+  patch_size_coarse: 48       # P_c — targets collective/sequence anomalies
+
+  # Mamba-2 encoder (same hyperparams for both streams; weight-shared across channels)
+  d_model: 128                # Embedding dimension
+  d_state: 64                 # SSM state dimension (ablation A9: 16/32/64/128)
+  expand: 2                   # Mamba inner dimension = d_model * expand
+  d_conv: 4                   # Depthwise conv kernel size
+  num_heads: 4                # Mamba-2 heads (d_model / headdim=32)
+  num_mamba_blocks: 2         # Mamba-2 blocks per scale
+
+  # Partial channel dependence
+  cd_num_heads: 4             # MHA heads for cross-channel attention (min(4, V) at runtime)
+  gumbel_tau_init: 2.0        # Initial Gumbel-softmax temperature
+  gumbel_tau_min: 0.1         # Minimum temperature (binary convergence)
+  gumbel_decay: 0.997         # Per-step exponential decay factor
+  # tau_t = max(tau_min, tau_init * decay^step)
+
+  # Bottleneck decoder
+  d_bottleneck: 64            # d' — bottleneck latent dim (< d_model to prevent over-generalisation)
+
+  # Score fusion gate (hyperparameter, NOT a learned parameter)
+  # w is selected by sweeping {0.3, 0.5, 0.7} on TSB-AD-M Tuning set
+  fusion_w: 0.5               # Default (equal) — overridden after Tuning set sweep
+
+# ─────────────────────────────────────────────
+# Training
+# ─────────────────────────────────────────────
+training:
+  max_epochs: 50
+  patience: 7                 # Early stopping on val MSE (held-out normal data)
+  batch_size: 64
+  precision: bf16             # BF16 preferred; FP16 fallback for older T4
+
+  # Loss weights
+  alpha: 0.5                  # Weight for fine-stream MSE (1-alpha = coarse)
+  beta: 0.01                  # Weight for consistency regulariser
+
+  # Optimizer
+  optimizer: adamw
+  lr: 0.001
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+  # LR schedule
+  warmup_epochs: 5
+  lr_schedule: cosine
+
+  # Seeds
+  seeds_main: [42, 0, 1]      # 3 seeds for main table
+  seeds_ablation: [42]        # 1 seed for ablation variants
+
+  # Wall-clock guard (Kaggle 12h session cap)
+  max_train_seconds: 36000    # 10 hours — leaves 2h buffer per session
+
+# ─────────────────────────────────────────────
+# Scoring and Thresholding
+# ─────────────────────────────────────────────
+scoring:
+  gaussian_smooth_sigma: 1.0  # Post-score Gaussian smoothing kernel
+  dspot_q: 0.0001             # Target false-alarm rate (1e-4)
+  dspot_level: 0.98           # Initial POT level (98th percentile)
+  dspot_n_init: 1000          # Min points for initial GPD fit
+
+# ─────────────────────────────────────────────
+# Evaluation
+# ─────────────────────────────────────────────
+evaluation:
+  primary_metric: vus_pr
+  supplementary_metric: dqe
+  vus_max_buffer: 100         # L_max for VUS integration (matches avg anomaly length)
+  pa_f1_in_main_table: false  # NEVER in main table — appendix only
+  metrics:                    # All 10 metrics computed for every run
+    - vus_pr
+    - dqe
+    - vus_roc
+    - auc_pr
+    - auc_roc
+    - standard_f1
+    - event_f1
+    - r_based_f1
+    - affiliation_f1
+    - pa_f1                   # Computed but reported in appendix only
+
+# ─────────────────────────────────────────────
+# Paths (relative to project root)
+# ─────────────────────────────────────────────
+paths:
+  checkpoints: checkpoints/
+  results: results/
+  scores: results/scores/
+  main_results_csv: results/main_results.csv
+  ablation_results_csv: results/ablation_results.csv
+  tsb_eval_csv: data/TSB-AD-M-Eva.csv
+  tsb_tuning_csv: data/TSB-AD-M-Tuning.csv
+
+# ─────────────────────────────────────────────
+# Ablation identifiers (for skip-logic)
+# ─────────────────────────────────────────────
+ablations:
+  - id: A1
+    name: fine_only
+    description: "Coarse stream removed"
+  - id: A2
+    name: coarse_only
+    description: "Fine stream removed"
+  - id: A3
+    name: single_scale_p24
+    description: "Single scale with P=24 (midpoint)"
+  - id: A4
+    name: attention_backbone
+    description: "Mamba replaced with standard MHA"
+  - id: A5
+    name: ci_only
+    description: "Partial CD module removed (channel-independent)"
+  - id: A6
+    name: no_bottleneck
+    description: "Bottleneck removed (d'=d=128)"
+  - id: A7
+    name: static_threshold
+    description: "DSPOT replaced with 99th-percentile static threshold"
+  - id: A8
+    name: equal_fusion
+    description: "w=0.5 fixed (no tuning-set selection)"
+  - id: A9
+    name: dstate_sweep
+    description: "d_state in {16, 32, 64, 128}"
+  - id: A10
+    name: full_model
+    description: "Full DS-PatchMamba (ablation baseline)"

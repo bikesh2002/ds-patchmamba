@@ -1,0 +1,30 @@
+# Core ML
+torch>=2.1.0
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+scipy>=1.11.0
+
+# Mamba-2 SSM (Kaggle: try mamba-ssm first, fallback mamba-minimal)
+# pip install mamba-ssm causal-conv1d
+# pip install git+https://github.com/johnma2006/mamba-minimal  (CPU fallback)
+
+# TSB-AD evaluation harness (VUS-PR, DQE)
+# pip install TSB-AD
+
+# Statistical testing
+scikit-posthocs>=0.7.0
+
+# Wavelet (for DWT-Recon cross-domain control)
+PyWavelets>=1.4.0
+
+# Vector Autoregression (T2-VAR baseline)
+statsmodels>=0.14.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Utilities
+tqdm>=4.65.0
+pyyaml>=6.0
