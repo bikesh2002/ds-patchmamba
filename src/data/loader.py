@@ -40,21 +40,125 @@ def _sanitize_sensor_data(arr: np.ndarray) -> np.ndarray:
 def _parse_binary_labels(raw_labels) -> np.ndarray:
     """
     Parse binary anomaly labels from numeric or string columns.
-    Handles: 0/1, 0.0/1.0, 'Normal'/'Attack', '0'/'1' strings.
+    Handles: 0/1, 0.0/1.0, 'Normal'/'Attack', '0'/'1' strings, True/False.
     """
     raw = np.asarray(raw_labels).ravel()
 
-    numeric = pd.to_numeric(raw, errors="coerce")
-    if np.isfinite(numeric).mean() > 0.95:
-        return (numeric.fillna(0).values != 0).astype(np.int32)
+    numeric = pd.to_numeric(pd.Series(raw), errors="coerce").values
+    finite_mask = np.isfinite(numeric)
+    if finite_mask.mean() > 0.95:
+        finite = numeric[finite_mask]
+        u = np.unique(finite)
+        if len(u) <= 3:
+            if set(u).issubset({0, 1, 0.0, 1.0}):
+                vals = np.where(np.isfinite(numeric), numeric, 0.0)
+                # Some uploads use 1=Normal (majority); standard SWaT uses 0=Normal
+                if (vals == 1).mean() > 0.5:
+                    return (vals == 0).astype(np.int32)
+                return (vals != 0).astype(np.int32)
+            # Generic two-class numeric: minority class = anomaly
+            lo = float(np.min(u))
+            hi = float(np.max(u))
+            filled = np.where(np.isfinite(numeric), numeric, lo)
+            labels = (filled == hi).astype(np.int32)
+            if labels.mean() > 0.5 and lo != hi:
+                labels = (filled == lo).astype(np.int32)
+            return labels.astype(np.int32)
 
     s = pd.Series(raw).astype(str).str.strip().str.lower()
-    labels = np.where(
+
+    if (s == "normal").mean() > 0.05:
+        return np.where(s == "normal", 0, 1).astype(np.int32)
+    if s.isin(["0", "0.0"]).mean() > 0.05:
+        return np.where(s.isin(["0", "0.0"]), 0, 1).astype(np.int32)
+    if s.isin(["false", "no"]).mean() > 0.05:
+        return np.where(s.isin(["false", "no"]), 0, 1).astype(np.int32)
+    if (s == "attack").mean() > 0.05:
+        return np.where(s == "attack", 1, 0).astype(np.int32)
+    if s.isin(["true", "false"]).any():
+        return np.where(s == "true", 1, 0).astype(np.int32)
+
+    return np.where(
         s.isin(["normal", "0", "0.0", "false", "no"]),
         0,
         1,
     ).astype(np.int32)
-    return labels
+
+
+def _detect_swat_label_column(df: pd.DataFrame) -> str:
+    """
+    Find the label column in SWaT attack.csv.
+
+    Prefers columns whose parsed labels yield a realistic anomaly ratio
+    (SWaT benchmark test set is ~5–30% anomalies, not 100%).
+    """
+    name_hints = (
+        "normal/attack", "normal_attack", "label", "labels",
+        "anomaly", "attack_label", "normal", "attack",
+    )
+
+    candidates: List[str] = []
+    for col in df.columns:
+        key = str(col).strip().lower().replace(" ", "").replace("-", "_")
+        if any(h in key for h in name_hints):
+            candidates.append(col)
+        elif df[col].nunique(dropna=True) <= 5:
+            candidates.append(col)
+
+    if df.columns[-1] not in candidates:
+        candidates.append(df.columns[-1])
+
+    # De-duplicate while preserving order
+    seen = set()
+    unique_candidates = []
+    for col in candidates:
+        if col not in seen:
+            seen.add(col)
+            unique_candidates.append(col)
+
+    best_col = None
+    best_score = float("inf")
+    for col in unique_candidates:
+        try:
+            labels = _parse_binary_labels(df[col].values)
+            ratio = float(labels.mean())
+            if 0.001 <= ratio <= 0.45:
+                score = abs(ratio - 0.127)
+                if score < best_score:
+                    best_score = score
+                    best_col = col
+        except Exception:
+            continue
+
+    if best_col is not None:
+        return best_col
+
+    # Fallback: first name match, else last column
+    for col in df.columns:
+        key = str(col).strip().lower()
+        if key in ("normal/attack", "label", "labels"):
+            return col
+    return df.columns[-1]
+
+
+def _read_swat_test_with_labels(
+    path: str,
+) -> Tuple[pd.DataFrame, str, np.ndarray, float]:
+    """Load a SWaT test CSV and return (df, label_col, binary labels, anomaly ratio)."""
+    df = pd.read_csv(path, header=0, low_memory=False)
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+
+    label_col   = _detect_swat_label_column(df)
+    test_labels = _parse_binary_labels(df[label_col].values)
+    ratio       = float(test_labels.mean())
+
+    if ratio > 0.9:
+        flipped = 1 - test_labels
+        if 0.001 <= flipped.mean() <= 0.45:
+            test_labels = flipped
+            ratio       = float(test_labels.mean())
+
+    return df, label_col, test_labels, ratio
 
 
 @dataclass
@@ -393,30 +497,40 @@ def _load_swat_style(
     train_data = _sanitize_sensor_data(train_df.values)
 
     # ── Load test data + labels ────────────────────────────────────────────
-    attack_df = pd.read_csv(attack_path, header=0, low_memory=False)
-    attack_df = attack_df.loc[:, ~attack_df.columns.str.startswith("Unnamed")]
+    merged_path = os.path.join(base, "merged.csv")
+    test_candidates = [attack_path]
+    if os.path.exists(merged_path):
+        test_candidates.append(merged_path)
 
-    # Identify the label column — last column, or one named Normal/Attack/label
-    label_col = None
-    for col in attack_df.columns:
-        if col.strip().lower() in ("normal/attack", "label", "labels", "attack", "anomaly"):
-            label_col = col
-            break
-    if label_col is None:
-        # Fall back to last column if it contains only two unique values
-        last_col = attack_df.columns[-1]
-        if attack_df[last_col].nunique() <= 2:
-            label_col = last_col
+    best: Optional[Tuple[str, pd.DataFrame, str, np.ndarray, float]] = None
+    best_score = float("inf")
+    for path in test_candidates:
+        try:
+            df, label_col, labels, ratio = _read_swat_test_with_labels(path)
+            if 0.001 <= ratio <= 0.45:
+                score = abs(ratio - 0.127)
+                if score < best_score:
+                    best_score = score
+                    best = (path, df, label_col, labels, ratio)
+        except Exception:
+            continue
 
-    if label_col is None:
-        raise ValueError(
-            f"Could not identify a label column in {attack_path}.\n"
-            f"Columns found: {list(attack_df.columns)}"
+    if best is not None:
+        test_path, attack_df, label_col, test_labels, ratio = best
+        if test_path != attack_path:
+            print(
+                f"  [INFO] {dataset}: using {os.path.basename(test_path)} for test "
+                f"(anomaly ratio {ratio:.1%}, label col={label_col!r})."
+            )
+    else:
+        attack_df, label_col, test_labels, ratio = _read_swat_test_with_labels(
+            attack_path
         )
-
-    raw_labels = attack_df[label_col].values
-    # Convert labels to binary int32 (handles numeric and string labels)
-    test_labels = _parse_binary_labels(raw_labels)
+        if ratio > 0.45:
+            print(
+                f"  [WARN] {dataset}: anomaly ratio {ratio:.1%} from attack.csv "
+                f"(label col={label_col!r}) — verify SWaT label format."
+            )
 
     # Drop label column; keep only numeric sensor columns
     sensor_cols = [c for c in attack_df.columns if c != label_col]
