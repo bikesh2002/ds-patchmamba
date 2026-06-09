@@ -478,19 +478,17 @@ def _read_data_file(path: str, numeric_only: bool = True) -> np.ndarray:
     if path.lower().endswith(".csv"):
         return _read_csv_numeric(path)
 
-    # .txt files — try comma first (some SMD Kaggle uploads), then whitespace.
-    for sep in [",", r"\s+"]:
-        df = pd.read_csv(path, header=None, sep=sep, low_memory=False)
-
-        # Skip a header row if the first cell is non-numeric text
-        first = df.iloc[0, 0]
-        if isinstance(first, str) and not _looks_numeric(first):
-            df = df.iloc[1:].reset_index(drop=True)
-
-        num = df.apply(pd.to_numeric, errors="coerce")
-        num = num.dropna(axis=1, how="all").dropna(axis=0, how="all")
-        if num.shape[1] > 0:
-            return num.values
+    # .txt files — pure numeric sensor data (SMD).
+    # np.loadtxt is more reliable than pandas for headerless comma/space files.
+    for delimiter in (",", None):   # None = any whitespace
+        try:
+            arr = np.loadtxt(path, delimiter=delimiter, dtype=np.float64)
+            if arr.ndim == 1:
+                arr = arr.reshape(-1, 1)
+            if arr.size > 0 and arr.shape[1] > 0:
+                return arr
+        except (ValueError, OSError):
+            continue
 
     raise ValueError(f"No numeric data found in {path}")
 
@@ -540,6 +538,13 @@ def _read_label_file(path: str) -> np.ndarray:
     Read a binary label file (0/1) from legacy datasets.
     Handles optional header row and named label columns.
     """
+    path = str(path)
+
+    # SMD test_label/*.txt — one binary label per line, no header
+    if path.lower().endswith(".txt"):
+        vals = np.loadtxt(path, dtype=np.float64)
+        return vals.astype(np.int32).ravel()
+
     df = pd.read_csv(path, low_memory=False)
 
     # Headerless single-column file: first value became column name '0' or '1'.
