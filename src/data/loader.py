@@ -478,8 +478,19 @@ def _read_data_file(path: str, numeric_only: bool = True) -> np.ndarray:
     if path.lower().endswith(".csv"):
         return _read_csv_numeric(path)
 
-    # .txt files — pure numeric sensor data (SMD).
-    # np.loadtxt is more reliable than pandas for headerless comma/space files.
+    return _read_txt_numeric(path)
+
+
+def _read_txt_numeric(path: str) -> np.ndarray:
+    """
+    Read headerless .txt sensor files (SMD).
+
+    SMD files are comma-separated floats, one row per timestep.
+    np.loadtxt is the primary parser; pandas is fallback only.
+    """
+    path = str(path)
+
+    # Primary: np.loadtxt (fast and reliable for clean numeric SMD files)
     for delimiter in (",", None):   # None = any whitespace
         try:
             arr = np.loadtxt(path, delimiter=delimiter, dtype=np.float64)
@@ -488,6 +499,17 @@ def _read_data_file(path: str, numeric_only: bool = True) -> np.ndarray:
             if arr.size > 0 and arr.shape[1] > 0:
                 return arr
         except (ValueError, OSError):
+            continue
+
+    # Fallback: pandas (tolerant of ragged rows)
+    for sep in [",", r"\s+"]:
+        try:
+            df = pd.read_csv(path, header=None, sep=sep, low_memory=False)
+            num = df.apply(pd.to_numeric, errors="coerce")
+            num = num.dropna(axis=1, how="all").dropna(axis=0, how="any")
+            if num.shape[1] > 0 and num.shape[0] > 0:
+                return num.values
+        except Exception:
             continue
 
     raise ValueError(f"No numeric data found in {path}")
