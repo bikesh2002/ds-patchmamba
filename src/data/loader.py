@@ -202,14 +202,26 @@ def load_legacy(
     if os.path.exists(normal_path) and os.path.exists(attack_path):
         return _load_swat_style(base, dataset, normal_path, attack_path, normalize)
 
+    # ── Convention D: PSM-style flat files (train.csv + test.csv + test_label.csv)
+    # All three files sit in the same directory with no subfolders.
+    train_flat = os.path.join(base, "train.csv")
+    test_flat  = os.path.join(base, "test.csv")
+    for label_name in ("test_label.csv", "labels.csv", "test_labels.csv"):
+        label_flat = os.path.join(base, label_name)
+        if os.path.exists(train_flat) and os.path.exists(test_flat) and os.path.exists(label_flat):
+            return _load_flat_style(base, dataset, train_flat, test_flat, label_flat, normalize)
+
     # ── Locate train folder (Convention A and B) ───────────────────────────
     train_dir = os.path.join(base, "train")
     if not os.path.exists(train_dir):
         raise FileNotFoundError(
-            f"train/ folder not found at: {train_dir}\n"
-            f"Also looked for normal.csv + attack.csv at {base} — not found.\n"
-            f"On Kaggle: add the '{dataset}' dataset as an input and update "
-            f"LEGACY_PATHS in Cell 1 to its mount path."
+            f"Could not load '{dataset}' from {base}.\n"
+            f"Tried all supported conventions:\n"
+            f"  A: train/, test/, test_label/ subfolders with .txt files (SMD)\n"
+            f"  B: train/, test/, labels/ subfolders with .csv files\n"
+            f"  C: normal.csv + attack.csv flat files (SWaT)\n"
+            f"  D: train.csv + test.csv + test_label.csv flat files (PSM)\n"
+            f"Check the folder structure and update LEGACY_PATHS in Cell 1."
         )
 
     # ── Locate test folder ─────────────────────────────────────────────────
@@ -369,6 +381,49 @@ def _load_swat_style(
         test=test_data,
         labels=test_labels,
         V=V,
+        avg_length=(len(train_data) + len(test_data)) / 2,
+    )]
+
+
+def _load_flat_style(
+    base: str,
+    dataset: str,
+    train_path: str,
+    test_path: str,
+    label_path: str,
+    normalize: bool,
+) -> List[SeriesRecord]:
+    """
+    Load PSM-style datasets where train.csv, test.csv, test_label.csv
+    all sit in the same directory with no subfolders.
+
+    PSM structure:
+        data/train.csv        — (132481, 25) no header
+        data/test.csv         — (87841,  25) no header
+        data/test_label.csv   — (87841,   1) binary labels, no header
+    """
+    train_data  = _read_data_file(train_path).astype(np.float32)
+    test_data   = _read_data_file(test_path).astype(np.float32)
+    test_labels = _read_data_file(label_path).squeeze().astype(np.int32)
+
+    if test_labels.ndim == 0:
+        test_labels = test_labels.reshape(1)
+
+    if len(test_data) != len(test_labels):
+        raise ValueError(
+            f"Length mismatch in {test_path}: "
+            f"test has {len(test_data)} rows, labels has {len(test_labels)} entries."
+        )
+
+    if normalize:
+        train_data, test_data = zscore_normalize(train_data, test_data)
+
+    return [SeriesRecord(
+        name=f"{dataset}_main",
+        train=train_data,
+        test=test_data,
+        labels=test_labels,
+        V=train_data.shape[1],
         avg_length=(len(train_data) + len(test_data)) / 2,
     )]
 
