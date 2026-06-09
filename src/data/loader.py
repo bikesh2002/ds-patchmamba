@@ -547,6 +547,9 @@ def _load_swat_test_period(
         f"using last {test_len:,} rows of merged.csv as the 4-day test period."
     )
     return mdf, mcol, test_labels, ratio, f"merged.csv (last {test_len:,} rows)"
+
+
+def _load_swat_style(
     base: str,
     dataset: str,
     normal_path: str,
