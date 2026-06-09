@@ -16,6 +16,9 @@ Key design decision — single TSB-AD call per (scores, labels) pair:
 import numpy as np
 from typing import Dict, Optional
 
+# NumPy 2.0 removed np.trapz in favour of np.trapezoid
+_trapezoid = getattr(np, "trapezoid", getattr(np, "trapz"))
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TSB-AD package (VUS-PR, VUS-ROC)
 # Installed via: pip install TSB-AD
@@ -185,7 +188,7 @@ def _manual_vus_pr(
 
         # Sort by recall ascending for trapz integration
         order     = np.argsort(recall)
-        aupr      = float(np.trapz(precision[order], recall[order]))
+        aupr      = float(_trapezoid(precision[order], recall[order]))
         aupr_list.append(aupr)
 
     return float(np.mean(aupr_list))
